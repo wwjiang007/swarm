@@ -1,7 +1,7 @@
 {
 	"ImportPath": "github.com/docker/swarm",
 	"GoVersion": "go1.7",
-	"GodepVersion": "v74",
+	"GodepVersion": "v79",
 	"Packages": [
 		"./..."
 	],
@@ -16,7 +16,7 @@
 			"Rev": "3ec0642a7fb6488f65b06f9040adc67e3990296a"
 		},
 		{
-			"ImportPath": "github.com/codegangsta/cli",
+			"ImportPath": "github.com/urfave/cli",
 			"Comment": "v1.11.1",
 			"Rev": "c31a7975863e7810c92e2e288a9ab074f9a88f29"
 		},
@@ -363,7 +363,7 @@
 		},
 		{
 			"ImportPath": "github.com/samuel/go-zookeeper/zk",
-			"Rev": "218e9c81c0dd8b3b18172b2bbfad92cc7d6db55f"
+			"Rev": "1d7be4effb13d2d908342d349d71a284a7542693"
 		},
 		{
 			"ImportPath": "github.com/skarademir/naturalsort",
