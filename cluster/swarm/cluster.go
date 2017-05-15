@@ -20,7 +20,7 @@ import (
 	engineapi "github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/discovery"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/go-units"
+	units "github.com/docker/go-units"
 	"github.com/docker/swarm/cluster"
 	"github.com/docker/swarm/scheduler"
 	"github.com/docker/swarm/scheduler/node"
@@ -260,10 +260,10 @@ func (c *Cluster) RemoveNetwork(network *cluster.Network) error {
 		}
 	} else if engineapi.IsErrConnectionFailed(err) && network.Scope == "global" {
 		log.Debug("The original engine is unreachable - Attempting to remove global network from the reachable engines...")
-		for _, engine := range c.engines {
+		for _, engine := range c.listActiveEngines() {
 			e1 := engine.RemoveNetwork(network)
 			if e1 == nil {
-				for _, engine := range c.engines {
+				for _, engine := range c.listActiveEngines() {
 					engine.DeleteNetwork(network)
 				}
 				err = nil
@@ -372,10 +372,10 @@ func (c *Cluster) removeEngine(addr string) bool {
 	if engine == nil {
 		return false
 	}
+	engine.Disconnect()
+
 	c.Lock()
 	defer c.Unlock()
-
-	engine.Disconnect()
 	// it could be in pendingEngines or engines
 	if _, ok := c.pendingEngines[addr]; ok {
 		delete(c.pendingEngines, addr)
@@ -400,10 +400,12 @@ func (c *Cluster) monitorDiscovery(ch <-chan discovery.Entries, errCh <-chan err
 			// if there's already an engine with the same ID.  If an engine
 			// changes address, we have to first remove it then add it back.
 			for _, entry := range removed {
+				log.Debugf("Discovery: remove engine %s", entry.String())
 				c.removeEngine(entry.String())
 			}
 
 			for _, entry := range added {
+				log.Debugf("Discovery: add engine %s", entry.String())
 				c.addEngine(entry.String())
 			}
 		case err := <-errCh:
@@ -452,9 +454,7 @@ func (c *Cluster) Image(IDOrName string) *cluster.Image {
 		return nil
 	}
 
-	c.RLock()
-	defer c.RUnlock()
-	for _, e := range c.engines {
+	for _, e := range c.listActiveEngines() {
 		if image := e.Image(IDOrName); image != nil {
 			return image
 		}
@@ -465,25 +465,33 @@ func (c *Cluster) Image(IDOrName string) *cluster.Image {
 
 // RemoveImages removes all the images that match `name` from the cluster.
 func (c *Cluster) RemoveImages(name string, force bool) ([]types.ImageDelete, error) {
-	c.Lock()
-	defer c.Unlock()
-
 	out := []types.ImageDelete{}
 	errs := []string{}
-	var err error
-	for _, e := range c.engines {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, e := range c.listActiveEngines() {
 		for _, image := range e.Images() {
 			if image.Match(name, true) {
-				content, err := image.Engine.RemoveImage(name, force)
-				if err != nil {
-					errs = append(errs, fmt.Sprintf("%s: %s", image.Engine.Name, err.Error()))
-					continue
-				}
-				out = append(out, content...)
+				wg.Add(1)
+				go func(image *cluster.Image) {
+					defer wg.Done()
+					content, err := image.Engine.RemoveImage(name, force)
+					if err != nil {
+						mu.Lock()
+						errs = append(errs, fmt.Sprintf("%s: %s", image.Engine.Name, err.Error()))
+						mu.Unlock()
+						return
+					}
+					mu.Lock()
+					out = append(out, content...)
+					mu.Unlock()
+				}(image)
 			}
 		}
 	}
+	wg.Wait()
 
+	var err error
 	if len(errs) > 0 {
 		err = errors.New(strings.Join(errs, "\n"))
 	}
@@ -541,8 +549,7 @@ func (c *Cluster) CreateVolume(request *volume.VolumesCreateBody) (*types.Volume
 		request.Name = parts[1]
 	}
 	if node == "" {
-		c.RLock()
-		for _, e := range c.engines {
+		for _, e := range c.listActiveEngines() {
 			wg.Add(1)
 
 			go func(engine *cluster.Engine) {
@@ -558,8 +565,6 @@ func (c *Cluster) CreateVolume(request *volume.VolumesCreateBody) (*types.Volume
 				}
 			}(e)
 		}
-		c.RUnlock()
-
 		wg.Wait()
 	} else {
 		config := cluster.BuildContainerConfig(containertypes.Config{Env: []string{"constraint:node==" + parts[0]}}, containertypes.HostConfig{}, networktypes.NetworkingConfig{})
@@ -584,21 +589,31 @@ func (c *Cluster) CreateVolume(request *volume.VolumesCreateBody) (*types.Volume
 
 // RemoveVolumes removes all the volumes that match `name` from the cluster.
 func (c *Cluster) RemoveVolumes(name string) (bool, error) {
-	c.Lock()
-	defer c.Unlock()
-
 	found := false
 	errs := []string{}
-	var err error
-	for _, e := range c.engines {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, e := range c.listActiveEngines() {
 		if volume := e.Volumes().Get(name); volume != nil {
-			if err := volume.Engine.RemoveVolume(volume.Name); err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %s", volume.Engine.Name, err.Error()))
-				continue
-			}
-			found = true
+			wg.Add(1)
+			go func(volume *cluster.Volume) {
+				defer wg.Done()
+				err := volume.Engine.RemoveVolume(volume.Name)
+				if err != nil {
+					mu.Lock()
+					errs = append(errs, fmt.Sprintf("%s: %s", volume.Engine.Name, err.Error()))
+					mu.Unlock()
+					return
+				}
+				mu.Lock()
+				found = true
+				mu.Unlock()
+			}(volume)
 		}
 	}
+	wg.Wait()
+
+	var err error
 	if len(errs) > 0 {
 		err = errors.New(strings.Join(errs, "\n"))
 	}
@@ -606,41 +621,56 @@ func (c *Cluster) RemoveVolumes(name string) (bool, error) {
 }
 
 // Pull is exported.
-func (c *Cluster) Pull(name string, authConfig *types.AuthConfig, callback func(where, status string, err error)) {
+func (c *Cluster) Pull(name string, authConfig *types.AuthConfig, callback func(msg cluster.JSONMessageWrapper)) {
 	var wg sync.WaitGroup
 
-	c.RLock()
-	for _, e := range c.engines {
+	for _, e := range c.listActiveEngines() {
 		wg.Add(1)
 
 		go func(engine *cluster.Engine) {
 			defer wg.Done()
 
 			if callback != nil {
-				callback(engine.Name, "", nil)
+				callback(cluster.JSONMessageWrapper{
+					EngineName: engine.Name,
+				})
 			}
-			err := engine.Pull(name, authConfig)
+
+			var engineCallback func(msg cluster.JSONMessage)
+			if callback != nil {
+				engineCallback = func(msg cluster.JSONMessage) {
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Msg:        msg,
+					})
+				}
+			}
+			err := engine.Pull(name, authConfig, engineCallback)
 			if callback != nil {
 				if err != nil {
-					callback(engine.Name, "", err)
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Err:        err,
+					})
 				} else {
-					callback(engine.Name, "downloaded", nil)
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Success:    true,
+					})
 				}
 			}
 		}(e)
 	}
-	c.RUnlock()
 
 	wg.Wait()
 }
 
 // Load loads image.
-func (c *Cluster) Load(imageReader io.Reader, callback func(where, status string, err error)) {
+func (c *Cluster) Load(imageReader io.Reader, callback func(msg cluster.JSONMessageWrapper)) {
 	var wg sync.WaitGroup
 
-	c.RLock()
 	pipeWriters := []*io.PipeWriter{}
-	for _, e := range c.engines {
+	for _, e := range c.listActiveEngines() {
 		wg.Add(1)
 
 		pipeReader, pipeWriter := io.Pipe()
@@ -651,15 +681,26 @@ func (c *Cluster) Load(imageReader io.Reader, callback func(where, status string
 			defer reader.Close()
 
 			// call engine load image
-			err := engine.Load(reader)
+			var engineCallback func(msg cluster.JSONMessage)
+			if callback != nil {
+				engineCallback = func(msg cluster.JSONMessage) {
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Msg:        msg,
+					})
+				}
+			}
+			err := engine.Load(reader, engineCallback)
 			if callback != nil {
 				if err != nil {
-					callback(engine.Name, "", err)
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Err:        err,
+					})
 				}
 			}
 		}(pipeReader, e)
 	}
-	c.RUnlock()
 
 	// create multi-writer
 	listWriter := []io.Writer{}
@@ -683,12 +724,11 @@ func (c *Cluster) Load(imageReader io.Reader, callback func(where, status string
 }
 
 // Import imports image.
-func (c *Cluster) Import(source string, ref string, tag string, imageReader io.Reader, callback func(what, status string, err error)) {
+func (c *Cluster) Import(source string, ref string, tag string, imageReader io.Reader, callback func(msg cluster.JSONMessageWrapper)) {
 	var wg sync.WaitGroup
-	c.RLock()
 	pipeWriters := []*io.PipeWriter{}
 
-	for _, e := range c.engines {
+	for _, e := range c.listActiveEngines() {
 		wg.Add(1)
 
 		pipeReader, pipeWriter := io.Pipe()
@@ -699,18 +739,32 @@ func (c *Cluster) Import(source string, ref string, tag string, imageReader io.R
 			defer reader.Close()
 
 			// call engine import
-			err := engine.Import(source, ref, tag, reader)
+			var engineCallback func(msg cluster.JSONMessage)
+			if callback != nil {
+				engineCallback = func(msg cluster.JSONMessage) {
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Msg:        msg,
+					})
+				}
+			}
+			err := engine.Import(source, ref, tag, reader, engineCallback)
 			if callback != nil {
 				if err != nil {
-					callback(engine.Name, "", err)
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Err:        err,
+					})
 				} else {
-					callback(engine.Name, "Import success", nil)
+					callback(cluster.JSONMessageWrapper{
+						EngineName: engine.Name,
+						Success:    true,
+					})
 				}
 			}
 
 		}(pipeReader, e)
 	}
-	c.RUnlock()
 
 	// create multi-writer
 	listWriter := []io.Writer{}
@@ -844,6 +898,17 @@ func (c *Cluster) listEngines() []*cluster.Engine {
 	return out
 }
 
+// listActiveEngines returns all the validated engines in the cluster.
+func (c *Cluster) listActiveEngines() []*cluster.Engine {
+	c.RLock()
+	defer c.RUnlock()
+	out := make([]*cluster.Engine, 0, len(c.engines))
+	for _, n := range c.engines {
+		out = append(out, n)
+	}
+	return out
+}
+
 // TotalMemory returns the total memory of the cluster.
 func (c *Cluster) TotalMemory() int64 {
 	var totalMemory int64
@@ -940,7 +1005,7 @@ func (c *Cluster) RenameContainer(container *cluster.Container, newName string) 
 }
 
 // BuildImage builds an image
-func (c *Cluster) BuildImage(buildContext io.Reader, buildImage *types.ImageBuildOptions, out io.Writer) error {
+func (c *Cluster) BuildImage(buildContext io.Reader, buildImage *types.ImageBuildOptions, callback func(msg cluster.JSONMessageWrapper)) error {
 	c.scheduler.Lock()
 
 	// get an engine
@@ -954,17 +1019,33 @@ func (c *Cluster) BuildImage(buildContext io.Reader, buildImage *types.ImageBuil
 		return err
 	}
 	n := nodes[0]
+	engine := c.engines[n.ID]
 
-	reader, err := c.engines[n.ID].BuildImage(buildContext, buildImage)
-	if err != nil {
-		return err
+	var engineCallback func(msg cluster.JSONMessage)
+	if callback != nil {
+		engineCallback = func(msg cluster.JSONMessage) {
+			callback(cluster.JSONMessageWrapper{
+				EngineName: engine.Name,
+				Msg:        msg,
+			})
+		}
+	}
+	err = engine.BuildImage(buildContext, buildImage, engineCallback)
+	if callback != nil {
+		if err != nil {
+			callback(cluster.JSONMessageWrapper{
+				EngineName: engine.Name,
+				Err:        err,
+			})
+		} else {
+			callback(cluster.JSONMessageWrapper{
+				EngineName: engine.Name,
+				Success:    true,
+			})
+		}
 	}
 
-	if _, err := io.Copy(out, reader); err != nil {
-		return err
-	}
-
-	c.engines[n.ID].RefreshImages()
+	engine.RefreshImages()
 	return nil
 }
 
@@ -995,13 +1076,10 @@ func (c *Cluster) RefreshEngine(hostname string) error {
 
 // TagImage tags an image.
 func (c *Cluster) TagImage(IDOrName string, ref string, force bool) error {
-	c.RLock()
-	defer c.RUnlock()
-
 	errs := []string{}
 	var err error
 	found := false
-	for _, e := range c.engines {
+	for _, e := range c.listActiveEngines() {
 		for _, image := range e.Images() {
 			if image.Match(IDOrName, true) {
 				found = true

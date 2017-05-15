@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -442,6 +443,19 @@ func (e *Engine) CheckConnectionErr(err error) {
 	// other errors may be ambiguous.
 }
 
+// EngineToContainerNode constructs types.ContainerNode from engine
+func (e *Engine) EngineToContainerNode() *types.ContainerNode {
+	return &types.ContainerNode{
+		ID:        e.ID,
+		IPAddress: e.IP,
+		Addr:      e.Addr,
+		Name:      e.Name,
+		Cpus:      int(e.Cpus),
+		Memory:    int64(e.Memory),
+		Labels:    e.Labels,
+	}
+}
+
 // Update API Version in apiClient
 func (e *Engine) updateClientVersionFromServer(serverVersion string) {
 	// v will be >= 1.8, since this is checked earlier
@@ -495,11 +509,16 @@ func (e *Engine) updateSpecs() error {
 	// Swarm/docker identifies engine by ID. Updating ID but not updating cluster
 	// index will put the cluster into inconsistent state. If this happens, the
 	// engine should be put to pending state for re-validation.
+	// We concatenate the engine ID and the address because sometimes engine
+	// IDs can be duplicated on different nodes (e.g. if a user has
+	// accidentally copied their /etc/docker/daemon.json file onto another
+	// node).
+	infoID := info.ID + "|" + e.Addr
 	if e.ID == "" {
-		e.ID = info.ID
-	} else if e.ID != info.ID {
+		e.ID = infoID
+	} else if e.ID != infoID {
 		e.state = statePending
-		message := fmt.Sprintf("Engine (ID: %s, Addr: %s) shows up with another ID:%s. Please remove it from cluster, it can be added back.", e.ID, e.Addr, info.ID)
+		message := fmt.Sprintf("Engine (ID: %s, Addr: %s) shows up with another ID:%s. Please remove it from cluster, it can be added back.", e.ID, e.Addr, infoID)
 		e.lastError = message
 		return errors.New(message)
 	}
@@ -542,6 +561,9 @@ func (e *Engine) updateSpecs() error {
 	}
 	if info.OperatingSystem != "" {
 		e.Labels["operatingsystem"] = info.OperatingSystem
+	}
+	if info.OSType != "" {
+		e.Labels["ostype"] = info.OSType
 	}
 	for _, label := range info.Labels {
 		kv := strings.SplitN(label, "=", 2)
@@ -986,7 +1008,7 @@ func (e *Engine) CreateContainer(config *ContainerConfig, name string, pullImage
 			return nil, err
 		}
 		// Otherwise, try to pull the image...
-		if err = e.Pull(config.Image, authConfig); err != nil {
+		if err = e.Pull(config.Image, authConfig, nil); err != nil {
 			return nil, err
 		}
 		// ...And try again.
@@ -1071,7 +1093,7 @@ func encodeAuthToBase64(authConfig *types.AuthConfig) (string, error) {
 }
 
 // Pull an image on the engine
-func (e *Engine) Pull(image string, authConfig *types.AuthConfig) error {
+func (e *Engine) Pull(image string, authConfig *types.AuthConfig, callback func(msg JSONMessage)) error {
 	encodedAuth, err := encodeAuthToBase64(authConfig)
 	if err != nil {
 		return err
@@ -1090,20 +1112,22 @@ func (e *Engine) Pull(image string, authConfig *types.AuthConfig) error {
 
 	defer pullResponseBody.Close()
 
-	// wait until the image download is finished
-	dec := json.NewDecoder(pullResponseBody)
-	m := map[string]interface{}{}
-	for {
-		if err := dec.Decode(&m); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
+	scanner := bufio.NewScanner(pullResponseBody)
+	for scanner.Scan() {
+		line := scanner.Text()
+		var msg JSONMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			log.Warnf("Malformed progress line during pull of %s: %s - %s", image, line, err)
+			continue
 		}
-	}
-	// if the final stream object contained an error, return it
-	if errMsg, ok := m["error"]; ok {
-		return fmt.Errorf("%v", errMsg)
+
+		if msg.Error != nil {
+			return fmt.Errorf("Failed to load %s: %s", image, msg.Error.Message)
+		}
+
+		if callback != nil {
+			callback(msg)
+		}
 	}
 
 	// force refresh images
@@ -1112,7 +1136,7 @@ func (e *Engine) Pull(image string, authConfig *types.AuthConfig) error {
 }
 
 // Load an image on the engine
-func (e *Engine) Load(reader io.Reader) error {
+func (e *Engine) Load(reader io.Reader, callback func(msg JSONMessage)) error {
 	loadResponse, err := e.apiClient.ImageLoad(context.Background(), reader, false)
 	e.CheckConnectionErr(err)
 	if err != nil {
@@ -1121,21 +1145,22 @@ func (e *Engine) Load(reader io.Reader) error {
 
 	defer loadResponse.Body.Close()
 
-	// wait until the image load is finished
-	dec := json.NewDecoder(loadResponse.Body)
-
-	m := map[string]interface{}{}
-	for {
-		if err := dec.Decode(&m); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
+	scanner := bufio.NewScanner(loadResponse.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		var msg JSONMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			log.Warnf("Malformed progress line during image load: %s - %s", line, err)
+			continue
 		}
-	}
-	// if the final stream object contained an error, return it
-	if errMsg, ok := m["error"]; ok {
-		return fmt.Errorf("%v", errMsg)
+
+		if msg.Error != nil {
+			return fmt.Errorf("Failed to load image: %s", msg.Error.Message)
+		}
+
+		if callback != nil {
+			callback(msg)
+		}
 	}
 
 	// force fresh images
@@ -1145,7 +1170,7 @@ func (e *Engine) Load(reader io.Reader) error {
 }
 
 // Import image
-func (e *Engine) Import(source string, ref string, tag string, imageReader io.Reader) error {
+func (e *Engine) Import(source string, ref string, tag string, imageReader io.Reader, callback func(msg JSONMessage)) error {
 	importSrc := types.ImageImportSource{
 		Source:     imageReader,
 		SourceName: source,
@@ -1154,10 +1179,30 @@ func (e *Engine) Import(source string, ref string, tag string, imageReader io.Re
 		Tag: tag,
 	}
 
-	_, err := e.apiClient.ImageImport(context.Background(), importSrc, ref, opts)
+	importResponseBody, err := e.apiClient.ImageImport(context.Background(), importSrc, ref, opts)
 	e.CheckConnectionErr(err)
 	if err != nil {
 		return err
+	}
+
+	defer importResponseBody.Close()
+
+	scanner := bufio.NewScanner(importResponseBody)
+	for scanner.Scan() {
+		line := scanner.Text()
+		var msg JSONMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			log.Warnf("Malformed progress line during import of %s: %s - %s", ref, line, err)
+			continue
+		}
+
+		if msg.Error != nil {
+			return fmt.Errorf("Failed to import %s: %s", ref, msg.Error.Message)
+		}
+
+		if callback != nil {
+			callback(msg)
+		}
 	}
 
 	// force fresh images
@@ -1378,6 +1423,28 @@ func (e *Engine) StartContainer(container *Container, hostConfig *dockerclient.H
 	return err
 }
 
+// InspectContainer inspects a container
+func (e *Engine) InspectContainer(id string) (*types.ContainerJSON, error) {
+	container, err := e.apiClient.ContainerInspect(context.Background(), id)
+	e.CheckConnectionErr(err)
+	if err != nil {
+		return nil, err
+	}
+
+	return &container, nil
+}
+
+// CreateContainerExec creates a container exec
+func (e *Engine) CreateContainerExec(id string, config types.ExecConfig) (types.IDResponse, error) {
+	execCreateResp, err := e.apiClient.ContainerExecCreate(context.Background(), id, config)
+	e.CheckConnectionErr(err)
+	if err != nil {
+		return types.IDResponse{}, err
+	}
+
+	return execCreateResp, nil
+}
+
 // RenameContainer renames a container
 func (e *Engine) RenameContainer(container *Container, newName string) error {
 	// send rename request
@@ -1393,13 +1460,32 @@ func (e *Engine) RenameContainer(container *Container, newName string) error {
 }
 
 // BuildImage builds an image
-func (e *Engine) BuildImage(buildContext io.Reader, buildImage *types.ImageBuildOptions) (io.ReadCloser, error) {
+func (e *Engine) BuildImage(buildContext io.Reader, buildImage *types.ImageBuildOptions, callback func(msg JSONMessage)) error {
 	resp, err := e.apiClient.ImageBuild(context.Background(), buildContext, *buildImage)
 	e.CheckConnectionErr(err)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return resp.Body, nil
+	defer resp.Body.Close()
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		var msg JSONMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			log.Warnf("Malformed progress line during image build: %s - %s", line, err)
+			continue
+		}
+
+		if msg.Error != nil {
+			return fmt.Errorf("Failed to build image: %s", msg.Error.Message)
+		}
+
+		if callback != nil {
+			callback(msg)
+		}
+	}
+	return nil
 }
 
 // TagImage tags an image

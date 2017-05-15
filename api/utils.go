@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,23 +17,12 @@ import (
 	"github.com/docker/swarm/cluster"
 )
 
+var imageOSErrorPattern = regexp.MustCompile(`image operating system "(.+)" cannot be used on this platform`)
+
 // Emit an HTTP error and log it.
 func httpError(w http.ResponseWriter, err string, status int) {
 	log.WithField("status", status).Errorf("HTTP error: %v", err)
 	http.Error(w, err, status)
-}
-
-func sendJSONMessage(w io.Writer, id, status string) {
-	message := struct {
-		ID       string      `json:"id,omitempty"`
-		Status   string      `json:"status,omitempty"`
-		Progress interface{} `json:"progressDetail,omitempty"`
-	}{
-		id,
-		status,
-		struct{}{}, // this is required by the docker cli to have a proper display
-	}
-	json.NewEncoder(w).Encode(message)
 }
 
 func sendErrorJSONMessage(w io.Writer, errorCode int, errorMessage string) {
@@ -378,4 +368,16 @@ func getImageRef(repo, tag string) string {
 		}
 	}
 	return ref
+}
+
+// This function matches a daemon error message that states that an image
+// cannot be built on a node because the image has a base image that uses the
+// wrong operating system. This function pulls out the required OS from the
+// error message.
+func matchImageOSError(errMsg string) string {
+	results := imageOSErrorPattern.FindStringSubmatch(errMsg)
+	if results == nil || len(results) < 2 {
+		return ""
+	}
+	return results[1]
 }
