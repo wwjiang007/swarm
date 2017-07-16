@@ -174,7 +174,7 @@ func (w *Watchdog) rescheduleContainers(e *Engine) {
 		log.Infof("Rescheduled container %s from %s to %s as %s", c.ID, c.Engine.Name, newContainer.Engine.Name, newContainer.ID)
 		if c.Info.State.Running {
 			log.Infof("Container %s was running, starting container %s", c.ID, newContainer.ID)
-			if err := w.cluster.StartContainer(newContainer, nil); err != nil {
+			if err := w.cluster.StartContainer(newContainer); err != nil {
 				log.Errorf("Failed to start rescheduled container %s: %v", newContainer.ID, err)
 			}
 		}
@@ -187,6 +187,6 @@ func NewWatchdog(cluster Cluster) *Watchdog {
 	w := &Watchdog{
 		cluster: cluster,
 	}
-	cluster.RegisterEventHandler(w)
+	cluster.RegisterEventHandler(w, nil)
 	return w
 }

@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +37,7 @@ import (
 
 const (
 	// Timeout for requests sent out to the engine.
-	requestTimeout = 10 * time.Second
+	requestTimeout = 30 * time.Second
 
 	// Threshold of delta duration between swarm manager and engine's systime
 	thresholdTime = 2 * time.Second
@@ -194,13 +195,13 @@ func (e *Engine) Connect(config *tls.Config) error {
 	e.url = url
 
 	// Use HTTP Client created above to create a dockerclient client
-	c, err := dockerclient.NewDockerClient(url.String(), config)
+	c := dockerclient.NewDockerClientFromHTTP(url, e.httpClient, config)
 	if err != nil {
 		return err
 	}
 
 	// Use HTTP Client used by dockerclient to create docker/api client
-	apiClient, err := engineapi.NewClient("tcp://"+e.Addr, "", c.HTTPClient, nil)
+	apiClient, err := engineapi.NewClient("tcp://"+e.Addr, "", e.httpClient, nil)
 	if err != nil {
 		return err
 	}
@@ -216,15 +217,23 @@ func (e *Engine) StartMonitorEvents() {
 	go func() {
 		if err := <-ec; err != nil {
 			log.WithFields(log.Fields{"name": e.Name, "id": e.ID}).WithError(err).Error("error monitoring events, will restart")
-			if !strings.Contains(err.Error(), "EOF") {
-				// failing node reconnect should use back-off strategy
-				<-e.refreshDelayer.Wait(e.getFailureCount())
+			// failing node reconnect should use back-off strategy to avoid frequent reconnect
+			retryInterval := e.getFailureCount() + 1
+			// maximum retry interval of 10 seconds
+			if retryInterval > 10 {
+				retryInterval = 10
 			}
+			<-time.After(time.Duration(retryInterval) * time.Second)
 			e.StartMonitorEvents()
 		}
 		close(ec)
 	}()
 
+	// this call starts a goroutine that collects events from the the engine, and returns an error to
+	// ec (the error channel) in case an error occurs. The corresponding Stop() function tears this
+	// down. The eventsMonitor itself is initialized using the apiClient and handler (defined below)
+	// The handler function processes events as received from the engine and decides what to do based
+	// on each event. Moreover, it also calls the eventHandler's Handle() function.
 	e.eventsMonitor.Start(ec)
 }
 
@@ -456,28 +465,11 @@ func (e *Engine) EngineToContainerNode() *types.ContainerNode {
 	}
 }
 
-// Update API Version in apiClient
-func (e *Engine) updateClientVersionFromServer(serverVersion string) {
-	// v will be >= 1.8, since this is checked earlier
-	switch {
-	case versions.LessThan(serverVersion, "1.9"):
-		e.apiClient.UpdateClientVersion("1.20")
-	case versions.LessThan(serverVersion, "1.10"):
-		e.apiClient.UpdateClientVersion("1.21")
-	case versions.LessThan(serverVersion, "1.11"):
-		e.apiClient.UpdateClientVersion("1.22")
-	case versions.LessThan(serverVersion, "1.12"):
-		e.apiClient.UpdateClientVersion("1.23")
-	case versions.LessThan(serverVersion, "1.13"):
-		e.apiClient.UpdateClientVersion("1.24")
-	default:
-		e.apiClient.UpdateClientVersion("1.25")
-	}
-}
-
 // Gather engine specs (CPU, memory, constraints, ...).
 func (e *Engine) updateSpecs() error {
-	info, err := e.apiClient.Info(context.Background())
+	ctx := context.Background()
+
+	info, err := e.apiClient.Info(ctx)
 	e.CheckConnectionErr(err)
 	if err != nil {
 		return err
@@ -487,7 +479,7 @@ func (e *Engine) updateSpecs() error {
 		return fmt.Errorf("cannot get resources for this engine, make sure %s is a Docker Engine, not a Swarm manager", e.Addr)
 	}
 
-	v, err := e.apiClient.ServerVersion(context.Background())
+	v, err := e.apiClient.ServerVersion(ctx)
 	e.CheckConnectionErr(err)
 	if err != nil {
 		return err
@@ -502,7 +494,7 @@ func (e *Engine) updateSpecs() error {
 	// update server version
 	e.Version = v.Version
 	// update client version. docker/api handles backward compatibility where needed
-	e.updateClientVersionFromServer(v.Version)
+	e.apiClient.NegotiateAPIVersion(ctx)
 
 	e.Lock()
 	defer e.Unlock()
@@ -592,7 +584,7 @@ func (e *Engine) updateSpecs() error {
 }
 
 // RemoveImage deletes an image from the engine.
-func (e *Engine) RemoveImage(name string, force bool) ([]types.ImageDelete, error) {
+func (e *Engine) RemoveImage(name string, force bool) ([]types.ImageDeleteResponseItem, error) {
 	rmOpts := types.ImageRemoveOptions{
 		Force:         force,
 		PruneChildren: true,
@@ -673,7 +665,7 @@ func (e *Engine) RefreshImages() error {
 
 // refreshNetwork refreshes single network on the engine.
 func (e *Engine) refreshNetwork(ID string) error {
-	network, err := e.apiClient.NetworkInspect(context.Background(), ID)
+	network, err := e.apiClient.NetworkInspect(context.Background(), ID, types.NetworkInspectOptions{})
 	e.CheckConnectionErr(err)
 	if err != nil {
 		if strings.Contains(err.Error(), "No such network") {
@@ -922,11 +914,95 @@ func (e *Engine) refreshLoop() {
 			e.RefreshVolumes()
 			e.RefreshNetworks()
 			e.RefreshImages()
-			log.WithFields(log.Fields{"id": e.ID, "name": e.Name}).Debugf("Engine update succeeded")
+			err := e.UpdateNetworkContainers("", false)
+			if err != nil {
+				log.WithFields(log.Fields{"id": e.ID, "name": e.Name}).Debugf("Engine refresh succeeded, but network containers update failed: %s", err.Error())
+			} else {
+				log.WithFields(log.Fields{"id": e.ID, "name": e.Name}).Debugf("Engine update succeeded")
+			}
 		} else {
 			log.WithFields(log.Fields{"id": e.ID, "name": e.Name}).Debugf("Engine refresh failed")
 		}
 	}
+}
+
+// UpdateNetworkContainers updates the list of containers attached to each network.
+// This is required because the RefreshNetworks uses NetworkList which has stopped
+// returning this information for recent API versions. Note that the container cache
+// is used to obtain this information, which means that if the container cache isn't
+// up to date for whatever reason, then the network information might be out of date
+// as well. This needs to be considered while designing networking related functionality.
+// Ideally, this function should only be used in the refresh loop, and called AFTER
+// RefreshNetworks() because RefreshNetworks() will not populate network information
+// correctly if container refresh hasn't taken place
+
+// The containerID argument can be provided along with a full argument can be used to
+// limit the update as it concerns only one container instead of doing it for all
+// containers. The idea is that sometimes only things about one container may have
+// changed, and we don't need to run the loop over all containers.
+func (e *Engine) UpdateNetworkContainers(containerID string, full bool) error {
+	containerMap := make(map[string]*Container)
+	if containerID != "" {
+		ctr, err := e.refreshContainer(containerID, full)
+		if err != nil {
+			return err
+		}
+		containerMap[containerID] = ctr
+	}
+
+	e.Lock()
+	defer e.Unlock()
+
+	// if a specific container is not being targeted, then an update for all containers
+	// will take place
+	if containerID == "" {
+		containerMap = e.containers
+	}
+
+	for _, c := range containerMap {
+		if c.NetworkSettings == nil {
+			continue
+		}
+		for _, n := range c.NetworkSettings.Networks {
+			engineNetwork, ok := e.networks[n.NetworkID]
+			if !ok {
+				// it shouldn't be the case that a network which a container is connected to wasn't
+				// even listed. Return an error when that happens.
+				return fmt.Errorf("container %s connected to network %s but the network wasn't listed in the refresh loop", c.ID, n.NetworkID)
+			}
+
+			// extract container name
+			ctrName := ""
+			if len(c.Names) != 0 {
+				if s := strings.Split(c.Names[0], "/"); len(s) > 1 {
+					ctrName = s[1]
+				} else {
+					ctrName = s[0]
+				}
+			}
+			// extract ip addresses
+			ipv4address := ""
+			ipv6address := ""
+			if n.IPAddress != "" {
+				ipv4address = n.IPAddress + "/" + strconv.Itoa(n.IPPrefixLen)
+			}
+			if n.GlobalIPv6Address != "" {
+				ipv6address = n.GlobalIPv6Address + "/" + strconv.Itoa(n.GlobalIPv6PrefixLen)
+			}
+			// update network information
+			if engineNetwork.Containers == nil {
+				engineNetwork.Containers = make(map[string]types.EndpointResource)
+			}
+			engineNetwork.Containers[c.ID] = types.EndpointResource{
+				Name:        ctrName,
+				EndpointID:  n.EndpointID,
+				MacAddress:  n.MacAddress,
+				IPv4Address: ipv4address,
+				IPv6Address: ipv6address,
+			}
+		}
+	}
+	return nil
 }
 
 func (e *Engine) emitEvent(event string) {
@@ -1283,6 +1359,7 @@ func (e *Engine) String() string {
 
 func (e *Engine) handler(msg events.Message) error {
 	// Something changed - refresh our internal state.
+	// TODO(nishanttotla): Possibly container events should trigger a container refresh
 
 	switch msg.Type {
 	case "network":
@@ -1392,15 +1469,11 @@ func (e *Engine) cleanupContainers() {
 }
 
 // StartContainer starts a container
-func (e *Engine) StartContainer(container *Container, hostConfig *dockerclient.HostConfig) error {
-	var err error
-	if hostConfig != nil {
-		err = e.client.StartContainer(container.ID, hostConfig)
-	} else {
-		// TODO(nishanttotla): Should ContainerStartOptions be provided?
-		err = e.apiClient.ContainerStart(context.Background(), container.ID, types.ContainerStartOptions{})
-	}
+func (e *Engine) StartContainer(container *Container) error {
+	// TODO(nishanttotla): Should ContainerStartOptions be provided?
+	err := e.apiClient.ContainerStart(context.Background(), container.ID, types.ContainerStartOptions{})
 	e.CheckConnectionErr(err)
+
 	if err != nil {
 		return err
 	}
@@ -1508,8 +1581,11 @@ func (e *Engine) NetworkDisconnect(container *Container, network string, force b
 	if err != nil {
 		return err
 	}
-
-	return e.RefreshNetworks()
+	err = e.RefreshNetworks()
+	if err != nil {
+		return err
+	}
+	return e.UpdateNetworkContainers(container.ID, true)
 }
 
 //IsConnectionError returns true when err is connection problem
@@ -1525,6 +1601,7 @@ func IsConnectionError(err error) bool {
 		strings.Contains(err.Error(), "annot connect to the Docker daemon")
 }
 
+// RefreshEngine refreshes container records from an engine
 func (e *Engine) RefreshEngine(hostname string) error {
 	if hostname != e.Name {
 		return fmt.Errorf("invalid engine name during refresh: %s vs %s", hostname, e.Name)

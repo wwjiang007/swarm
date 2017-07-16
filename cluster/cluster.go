@@ -5,7 +5,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/volume"
-	"github.com/samalba/dockerclient"
+	"github.com/docker/swarmkit/watch"
 )
 
 // Cluster is exported
@@ -23,13 +23,13 @@ type Cluster interface {
 	Image(IDOrName string) *Image
 
 	// RemoveImages removes images from the cluster.
-	RemoveImages(name string, force bool) ([]types.ImageDelete, error)
+	RemoveImages(name string, force bool) ([]types.ImageDeleteResponseItem, error)
 
 	// Containers returns all containers.
 	Containers() Containers
 
 	// StartContainer starts a container.
-	StartContainer(container *Container, hostConfig *dockerclient.HostConfig) error
+	StartContainer(container *Container) error
 
 	// Container returns the container matching `IDOrName`.
 	// TODO: remove this method from the interface as we can use
@@ -77,10 +77,13 @@ type Cluster interface {
 	TotalCpus() int64
 
 	// RegisterEventHandler registers an event handler for cluster-wide events.
-	RegisterEventHandler(h EventHandler) error
+	RegisterEventHandler(h EventHandler, q *watch.Queue) error
 
 	// UnregisterEventHandler unregisters an event handler.
 	UnregisterEventHandler(h EventHandler)
+
+	// CloseWatchQueue closes the watchQueue when the manager shuts down.
+	CloseWatchQueue()
 
 	// FIXME: remove this method
 	// RANDOMENGINE returns a random engine.

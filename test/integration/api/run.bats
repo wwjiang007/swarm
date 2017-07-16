@@ -33,6 +33,14 @@ function teardown() {
 	# run with --rm
 	docker_swarm run --rm busybox echo hello
 	[ "$status" -eq 0 ]
+	docker_swarm run --rm busybox echo hello
+	[ "$status" -eq 0 ]
+	docker_swarm run --rm busybox echo hello
+	[ "$status" -eq 0 ]
+
+	# check that containers were removed
+	docker_swarm ps -aq
+	[ "${#lines[@]}" -eq  1 ]
 }
 
 @test "docker run with image digest" {
@@ -157,10 +165,11 @@ function teardown() {
 	[[ "${output}" == *"10.0.0.42"* ]]
 }
 
-@test "docker run --net-alias" {
-	# docker run --net-alias is introduced in docker 1.10, skip older version without --net-alias
+@test "docker run --network-alias" {
+	# docker run --net-alias was introduced in docker 1.10, and later renamed to
+	# --network-alias. Only run tests for the latter.
 	run docker run --help
-	if [[ "${output}" != *"--net-alias"* ]]; then
+	if [[ "${output}" != *"--network-alias"* ]]; then
 		skip
 	fi
 
@@ -169,7 +178,7 @@ function teardown() {
 
 	docker_swarm network create -d bridge testn
 
-	docker_swarm run --name testc --net testn -d --net-alias=testa busybox sh
+	docker_swarm run --name testc --net testn -d --network-alias=testa busybox sh
 	run docker_swarm inspect testc
 	[[ "${output}" == *"testa"* ]]
 }
@@ -219,7 +228,8 @@ function teardown() {
 
 	# check error message
 	[[ "${output}" != *"unable to find a node that satisfies the constraint"* ]]
-	[[ "${output}" == *"not found"* ]]
+	# the error message changed sometime after 1.13, so we need to check both cases
+	[[ "${output}" == *"repository does not exist"* || "${output}" == *"not found"* ]]
 }
 
 @test "docker run - constraint and soft affinities" {

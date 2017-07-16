@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -26,11 +27,12 @@ import (
 	"github.com/docker/swarm/experimental"
 	"github.com/docker/swarm/version"
 	"github.com/gorilla/mux"
-	"github.com/samalba/dockerclient"
 )
 
-// APIVERSION is the API version supported by swarm manager
-const APIVERSION = "1.22"
+const (
+	// APIVERSION is the default API version supported by swarm manager
+	APIVERSION = "1.30"
+)
 
 var (
 	ShouldRefreshOnNodeFilter  = false
@@ -41,7 +43,7 @@ var (
 func getInfo(c *context, w http.ResponseWriter, r *http.Request) {
 	info := apitypes.Info{
 		Images:            len(c.cluster.Images().Filter(cluster.ImageFilterOptions{})),
-		NEventsListener:   c.eventsHandler.Size(),
+		NEventsListener:   int(atomic.LoadUint64(c.listenerCount)),
 		Debug:             c.debug,
 		MemoryLimit:       true,
 		SwapLimit:         true,
@@ -63,21 +65,7 @@ func getInfo(c *context, w http.ResponseWriter, r *http.Request) {
 		NoProxy:           os.Getenv("no_proxy"),
 		SystemTime:        time.Now().Format(time.RFC3339Nano),
 		ExperimentalBuild: experimental.ENABLED,
-	}
-
-	// API versions older than 1.22 use DriverStatus and return \b characters in the output
-	status := c.statusHandler.Status()
-	if c.apiVersion != "" && typesversions.LessThan(c.apiVersion, "1.22") {
-		for i := range status {
-			if status[i][0][:1] == " " {
-				status[i][0] = status[i][0][1:]
-			} else {
-				status[i][0] = "\b" + status[i][0]
-			}
-		}
-		info.DriverStatus = status
-	} else {
-		info.SystemStatus = status
+		SystemStatus:      c.statusHandler.Status(),
 	}
 
 	kernelVersion := "<unknown>"
@@ -355,6 +343,12 @@ func getVolumes(c *context, w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		if filters.Include("label") {
+			if !filters.MatchKVList("label", volume.Labels) {
+				continue
+			}
+		}
+
 		tmp := (*volume).Volume
 		if tmp.Driver == "local" {
 			// Check if the volume matches any node filters
@@ -486,6 +480,26 @@ func getContainersJSON(c *context, w http.ResponseWriter, r *http.Request) {
 				return nil
 			})
 			if err != volumeExist {
+				continue
+			}
+		}
+		if filters.Include("network") {
+			networkExist := fmt.Errorf("network attached to container")
+			err := filters.WalkValues("network", func(value string) error {
+				if _, ok := container.NetworkSettings.Networks[value]; ok {
+					return networkExist
+				}
+				for _, nw := range container.NetworkSettings.Networks {
+					if nw == nil {
+						continue
+					}
+					if strings.HasPrefix(nw.NetworkID, value) {
+						return networkExist
+					}
+				}
+				return nil
+			})
+			if err != networkExist {
 				continue
 			}
 		}
@@ -864,8 +878,55 @@ func getEvents(c *context, w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 
-	c.eventsHandler.Add(r.RemoteAddr, w)
-	c.eventsHandler.Wait(r.RemoteAddr, until)
+	eventsChan, cancelFunc := c.watchQueue.Watch()
+	defer cancelFunc()
+
+	atomic.AddUint64(c.listenerCount, 1)
+	defer atomic.AddUint64(c.listenerCount, ^uint64(0))
+
+	// create timer for --until
+	var (
+		timer   *time.Timer
+		timerCh <-chan time.Time
+	)
+	if until > 0 {
+		dur := time.Unix(until, 0).Sub(time.Now())
+		timer = time.NewTimer(dur)
+		timerCh = timer.C
+	}
+	var closeNotify <-chan bool
+	if closeNotifier, ok := w.(http.CloseNotifier); ok {
+		closeNotify = closeNotifier.CloseNotify()
+	}
+
+	for {
+		select {
+		case eChan, ok := <-eventsChan:
+			if !ok {
+				return
+			}
+			e, ok := eChan.(*cluster.Event)
+			if !ok {
+				break
+			}
+			data, err := normalizeEvent(e)
+			if err != nil {
+				return
+			}
+			_, err = w.Write(data)
+			if err != nil {
+				log.Debugf("failed to write event to output stream %s", err.Error())
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		case <-closeNotify:
+			return
+		case <-timerCh:
+			return
+		}
+	}
 }
 
 // POST /containers/{name:.*}/start
@@ -877,27 +938,14 @@ func postContainersStart(c *context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hostConfig := &dockerclient.HostConfig{
-		MemorySwappiness: -1,
-	}
-
-	buf, err := ioutil.ReadAll(r.Body)
+	_, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		httpError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	r.Body.Close()
 
-	if len(buf) <= 2 || (len(buf) == 4 && string(buf) == "null") {
-		hostConfig = nil
-	} else {
-		if err := json.Unmarshal(buf, hostConfig); err != nil {
-			httpError(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	}
-
-	if err := c.cluster.StartContainer(container, hostConfig); err != nil {
+	if err := c.cluster.StartContainer(container); err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1112,6 +1160,8 @@ func proxyNetworkConnect(c *context, w http.ResponseWriter, r *http.Request) {
 	cb := func(resp *http.Response) {
 		// force fresh networks on this engine
 		container.Engine.RefreshNetworks()
+		// force refresh this container so that it is up to date in the cache
+		container.Engine.UpdateNetworkContainers(container.ID, true)
 	}
 
 	// request is forwarded to the container's address
@@ -1457,4 +1507,26 @@ func notImplementedHandler(c *context, w http.ResponseWriter, r *http.Request) {
 
 func optionsHandler(c *context, w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
+}
+
+// headerFlusher is a convenient wrapper around http.ResponseWriter which
+// always flushes response headers to the client immediately.
+type headerFlusher struct {
+	http.ResponseWriter
+}
+
+func (h headerFlusher) WriteHeader(status int) {
+	h.ResponseWriter.WriteHeader(status)
+
+	// Try to flush the header immediately.
+	if flusher, ok := h.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// POST /containers/{name:.*}/wait
+// This endpoint is special because it is important to flush the response
+// header immediately.
+func postContainersWait(c *context, w http.ResponseWriter, r *http.Request) {
+	proxyContainerAndForceRefresh(c, headerFlusher{w}, r)
 }

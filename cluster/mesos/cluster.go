@@ -22,10 +22,10 @@ import (
 	"github.com/docker/swarm/cluster/mesos/task"
 	"github.com/docker/swarm/scheduler"
 	"github.com/docker/swarm/scheduler/node"
+	"github.com/docker/swarmkit/watch"
 	"github.com/gogo/protobuf/proto"
 	"github.com/mesos/mesos-go/mesosproto"
 	mesosscheduler "github.com/mesos/mesos-go/scheduler"
-	"github.com/samalba/dockerclient"
 )
 
 // Cluster struct for mesos
@@ -34,6 +34,7 @@ type Cluster struct {
 
 	dockerEnginePort    string
 	eventHandlers       *cluster.EventHandlers
+	watchQueue          *watch.Queue
 	master              string
 	agents              map[string]*agent
 	scheduler           *Scheduler
@@ -168,12 +169,20 @@ func NewCluster(scheduler *scheduler.Scheduler, TLSConfig *tls.Config, master st
 
 // Handle callbacks for the events
 func (c *Cluster) Handle(e *cluster.Event) error {
+	// publish event to the watchQueue for external subscribers
+	c.watchQueue.Publish(e)
+	// call Handle for other eventHandlers
 	c.eventHandlers.Handle(e)
 	return nil
 }
 
 // RegisterEventHandler registers an event handler.
-func (c *Cluster) RegisterEventHandler(h cluster.EventHandler) error {
+func (c *Cluster) RegisterEventHandler(h cluster.EventHandler, q *watch.Queue) error {
+	// only set if watchQueue hasn't been set already. This is to avoid issues because
+	// the watchdog code still uses the old event handler.
+	if q != nil && c.watchQueue == nil {
+		c.watchQueue = q
+	}
 	return c.eventHandlers.RegisterEventHandler(h)
 }
 
@@ -182,11 +191,16 @@ func (c *Cluster) UnregisterEventHandler(h cluster.EventHandler) {
 	c.eventHandlers.UnregisterEventHandler(h)
 }
 
+// CloseWatchQueue closes the watchQueue when the manager shuts down.
+func (c *Cluster) CloseWatchQueue() {
+	c.watchQueue.Close()
+}
+
 // StartContainer starts a container
-func (c *Cluster) StartContainer(container *cluster.Container, hostConfig *dockerclient.HostConfig) error {
+func (c *Cluster) StartContainer(container *cluster.Container) error {
 	// if the container was started less than a second ago in detach mode, do not start it
 	if time.Now().Unix()-container.Created > 1 || container.Config.Labels[cluster.SwarmLabelNamespace+".mesos.detach"] != "true" {
-		return container.Engine.StartContainer(container, hostConfig)
+		return container.Engine.StartContainer(container)
 	}
 	return nil
 }
@@ -256,7 +270,7 @@ func (c *Cluster) Image(IDOrName string) *cluster.Image {
 }
 
 // RemoveImages removes images from the cluster
-func (c *Cluster) RemoveImages(name string, force bool) ([]types.ImageDelete, error) {
+func (c *Cluster) RemoveImages(name string, force bool) ([]types.ImageDeleteResponseItem, error) {
 	return nil, errNotSupported
 }
 
@@ -362,7 +376,7 @@ func (c *Cluster) Container(IDOrName string) *cluster.Container {
 }
 
 // RemoveImage removes an image from the cluster
-func (c *Cluster) RemoveImage(image *cluster.Image) ([]types.ImageDelete, error) {
+func (c *Cluster) RemoveImage(image *cluster.Image) ([]types.ImageDeleteResponseItem, error) {
 	return nil, errNotSupported
 }
 
